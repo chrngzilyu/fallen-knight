@@ -1,0 +1,492 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <graphics.h>      
+#include <windows.h>
+#include <cmath>
+
+const int SCREEN_WIDTH = 800;
+const int SCREEN_HEIGHT = 600;
+const float GROUND_Y = 500.0f;
+
+int g_hitstopTimer = 0;
+int g_shakeTimer = 0;
+int g_shakeIntensity = 0;
+
+void TriggerHitstop(int frames) { g_hitstopTimer = frames; }
+void TriggerShake(int intensity, int frames) {
+    g_shakeIntensity = intensity;
+    g_shakeTimer = frames;
+}
+
+struct Rect { float x, y, w, h; };
+bool checkAABB(Rect a, Rect b) {
+    return (a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y);
+}
+
+class GameObject {
+protected:
+    float x, y;
+    float width, height;
+    bool isDead;
+public:
+    GameObject(float startX, float startY, float w, float h) : x(startX), y(startY), width(w), height(h), isDead(false) {}
+    virtual ~GameObject() {}
+    virtual void update() = 0;
+    virtual void draw() = 0;
+    bool getIsDead() const {
+        return isDead;
+    }
+    void kill() {
+        isDead = true;
+    }
+    Rect getHitbox() const { return { x, y, width, height }; }
+};
+
+std::vector<GameObject*> g_objects;
+void AddObject(GameObject* obj) { g_objects.push_back(obj); }
+
+class Entity : public GameObject {
+protected:
+    float vx, vy;
+    float ax, ay;
+    float friction;
+    float gravity;
+    float maxSpeed;
+    bool isGrounded;
+    int hp, maxHp;
+    int invincibilityTimer;
+    int flashTimer;
+
+public:
+    Entity(float x, float y, float w, float h, int health)
+        : GameObject(x, y, w, h), vx(0), vy(0), ax(0), ay(0), friction(0.8f), gravity(0.6f), maxSpeed(5.0f), isGrounded(false), hp(health), maxHp(health), invincibilityTimer(0), flashTimer(0) {
+    }
+
+    virtual void takeDamage(int damage, float knockbackX = 0) {
+        if (invincibilityTimer <= 0) {
+            hp -= damage;
+            invincibilityTimer = 30;
+            flashTimer = 5;
+            vx = knockbackX;
+            if (hp <= 0) {
+                hp = 0;
+                isDead = true;
+            }
+        }
+    }
+    int getHp() const {
+        return hp;
+    }
+    int getMaxHp() const { return maxHp; }
+};
+
+class Projectile : public GameObject {
+private:
+    float vx;
+public:
+    Projectile(float x, float y, float speed) : GameObject(x, y, 20, 40), vx(speed) {}
+    void update() override {
+        x += vx;
+        if (x < -50 || x > SCREEN_WIDTH + 50) isDead = true;
+    }
+    void draw() override {
+        setfillcolor(RGB(255, 100, 0));
+        solidrectangle((int)x, (int)y, (int)(x + width), (int)(y + height));
+    }
+};
+
+class Player : public Entity {
+private:
+    float jumpForce;
+    int dashCooldown;
+    int dashTimer;
+    bool facingRight;
+
+    bool isAttacking;
+    int attackTimer;
+    int attackDir;
+
+public:
+    Rect currentAttackBox;
+    bool isPogoAttacking;
+    Player(float startX, float startY) : Entity(startX, startY, 30.0f, 50.0f, 5) {
+        jumpForce = -13.0f;
+        maxSpeed = 6.0f;
+        dashCooldown = 0;
+        dashTimer = 0;
+        facingRight = true;
+        isAttacking = false;
+        attackTimer = 0;
+        isPogoAttacking = false;
+        currentAttackBox = { 0,0,0,0 };
+    }
+
+    void update() override {
+        if (invincibilityTimer > 0) invincibilityTimer--;
+        if (flashTimer > 0) flashTimer--;
+        if (dashCooldown > 0) dashCooldown--;
+        if (dashTimer > 0) {
+            dashTimer--;
+            vy = 0;
+            if (dashTimer == 0) vx *= 0.5f;
+        }
+        else {
+            ax = 0;
+            if (GetAsyncKeyState('A') & 0x8000) {
+                ax = -1.5f; facingRight = false;
+            }
+            if (GetAsyncKeyState('D') & 0x8000) {
+                ax = 1.5f;
+                facingRight = true;
+            }
+
+            if (ax != 0) {
+                vx += ax;
+                if (vx > maxSpeed) vx = maxSpeed;
+                if (vx < -maxSpeed) vx = -maxSpeed;
+            }
+            else {
+                vx *= friction;
+            }
+
+            if ((GetAsyncKeyState(VK_SPACE) & 0x8000) && isGrounded) {
+                vy = jumpForce;
+                isGrounded = false;
+            }
+            if (!(GetAsyncKeyState(VK_SPACE) & 0x8000) && vy < 0) {
+                vy *= 0.8f;
+            }
+
+            if (vy > 0) {
+                vy += gravity * 1.5f;
+            }
+            else {
+                vy += gravity;
+            }
+
+            if ((GetAsyncKeyState('K') & 0x8000) && dashCooldown == 0) {
+                dashTimer = 12;
+                dashCooldown = 60;
+                vx = facingRight ?
+                    18.0f : -18.0f;
+                invincibilityTimer = 15;
+            }
+
+            if ((GetAsyncKeyState('J') & 0x8000) && !isAttacking) {
+                isAttacking = true;
+                attackTimer = 12;
+
+                if (!isGrounded && (GetAsyncKeyState('S') & 0x8000)) {
+                    attackDir = 2;
+                    isPogoAttacking = true;
+                }
+                else {
+                    attackDir = facingRight ?
+                        1 : 0;
+                    isPogoAttacking = false;
+                }
+            }
+        }
+
+        x += vx;
+        y += vy;
+
+        if (y + height >= GROUND_Y) {
+            y = GROUND_Y - height;
+            vy = 0;
+            isGrounded = true;
+            if (dashTimer <= 0) dashCooldown = max(0, dashCooldown - 1);
+        }
+        else {
+            isGrounded = false;
+        }
+
+        if (x < 0) {
+            x = 0;
+            vx = 0;
+        }
+        if (x + width > SCREEN_WIDTH) {
+            x = SCREEN_WIDTH - width;
+            vx = 0;
+        }
+
+        if (isAttacking) {
+            attackTimer--;
+            if (attackTimer <= 0) {
+                isAttacking = false;
+                isPogoAttacking = false;
+                currentAttackBox = { 0,0,0,0 };
+            }
+            else {
+                if (attackDir == 0) currentAttackBox = { x - 45, y + 5, 45, 40 };
+                else if (attackDir == 1) currentAttackBox = { x + width, y + 5, 45, 40 };
+                else if (attackDir == 2) currentAttackBox = { x - 10, y + height, width + 20, 35 };
+            }
+        }
+    }
+
+    void draw() override {
+        if (flashTimer > 0) setfillcolor(WHITE);
+        else if (invincibilityTimer > 0 && (invincibilityTimer / 3) % 2 == 0) setfillcolor(RGB(150, 150, 150));
+        else if (dashTimer > 0) setfillcolor(RGB(50, 200, 250));
+        else setfillcolor(RGB(100, 150, 250));
+
+        solidrectangle((int)x, (int)y, (int)(x + width), (int)(y + height));
+        if (isAttacking) {
+            setfillcolor(WHITE);
+            solidrectangle((int)currentAttackBox.x, (int)currentAttackBox.y,
+                (int)(currentAttackBox.x + currentAttackBox.w),
+                (int)(currentAttackBox.y + currentAttackBox.h));
+        }
+    }
+
+    void pogoBounce() {
+        vy = jumpForce * 1.1f;
+        dashCooldown = 0;
+        isAttacking = false;
+        isPogoAttacking = false;
+        currentAttackBox = { 0,0,0,0 };
+    }
+
+    bool getIsAttacking() const {
+        return isAttacking;
+    }
+    bool getIsDashing() const { return dashTimer > 0; }
+};
+
+class Boss : public Entity {
+private:
+    enum State { IDLE, WANDER, CHARGE_WINDUP, DASH_ATTACK, PHASE2_SMASH };
+    State currentState;
+    int stateTimer;
+    int phase;
+
+public:
+    Boss(float startX, float startY) : Entity(startX, startY, 70.0f, 90.0f, 200) {
+        currentState = WANDER;
+        stateTimer = 0;
+        phase = 1;
+        vx = -2.0f;
+    }
+
+    void update() override {
+        if (invincibilityTimer > 0) invincibilityTimer--;
+        if (flashTimer > 0) flashTimer--;
+
+        if (phase == 1 && hp <= maxHp / 2) {
+            phase = 2;
+            currentState = PHASE2_SMASH;
+            stateTimer = 0;
+            TriggerHitstop(30);
+            TriggerShake(15, 20);
+        }
+
+        stateTimer++;
+        switch (currentState) {
+        case WANDER:
+            x += vx;
+            if (x < 50 || x > SCREEN_WIDTH - 50 - width) vx = -vx;
+            if (stateTimer > 120) {
+                currentState = CHARGE_WINDUP;
+                stateTimer = 0;
+            }
+            break;
+        case CHARGE_WINDUP:
+            vx = 0;
+            if (stateTimer > 40) {
+                currentState = DASH_ATTACK;
+                stateTimer = 0;
+                vx = (x > SCREEN_WIDTH / 2) ?
+                    -12.0f : 12.0f;
+            }
+            break;
+        case DASH_ATTACK:
+            x += vx;
+            vx *= 0.95f;
+            if (abs(vx) < 1.0f) {
+                currentState = WANDER;
+                stateTimer = 0;
+                vx = (x > SCREEN_WIDTH / 2) ? -3.0f : 3.0f;
+                if (phase == 2) vx *= 1.5f;
+            }
+            break;
+        case PHASE2_SMASH:
+            if (stateTimer == 1) {
+                vy = -15.0f;
+            }
+            vy += gravity;
+            y += vy;
+            if (y + height >= GROUND_Y) {
+                y = GROUND_Y - height;
+                vy = 0;
+                TriggerShake(20, 15);
+                AddObject(new Projectile(x - 20, GROUND_Y - 40, -8.0f));
+                AddObject(new Projectile(x + width, GROUND_Y - 40, 8.0f));
+
+                currentState = WANDER;
+                stateTimer = 0;
+                vx = (x > SCREEN_WIDTH / 2) ?
+                    -4.0f : 4.0f;
+            }
+            break;
+        }
+
+        if (x < 0) x = 0;
+        if (x + width > SCREEN_WIDTH) x = SCREEN_WIDTH - width;
+    }
+
+    void draw() override {
+        if (flashTimer > 0) setfillcolor(WHITE);
+        else if (phase == 2) setfillcolor(RGB(200, 30, 150));
+        else setfillcolor(RGB(200, 50, 50));
+
+        solidrectangle((int)x, (int)y, (int)(x + width), (int)(y + height));
+        setfillcolor(BLACK);
+        if (vx > 0) solidrectangle((int)x + 40, (int)y + 20, (int)x + 55, (int)y + 30);
+        else        solidrectangle((int)x + 15, (int)y + 20, (int)x + 30, (int)y + 30);
+        if (currentState == CHARGE_WINDUP) {
+            setlinecolor(YELLOW);
+            rectangle((int)x - 5, (int)y - 5, (int)(x + width) + 5, (int)(y + height) + 5);
+        }
+    }
+};
+
+void drawUI(Player* player, Boss* boss) {
+    settextcolor(WHITE);
+    settextstyle(20, 0, _T("Consolas"));
+    outtextxy(20, 20, _T("HP:"));
+    for (int i = 0; i < player->getMaxHp(); i++) {
+        if (i < player->getHp()) setfillcolor(RGB(100, 150, 250));
+        else setfillcolor(RGB(50, 50, 50));
+        solidrectangle(60 + i * 25, 20, 80 + i * 25, 35);
+    }
+
+    outtextxy(SCREEN_WIDTH - 320, 20, boss->getHp() <= boss->getMaxHp() / 2 ? _T("FALLEN KNIGHT (PHASE 2)") : _T("FALLEN KNIGHT"));
+    setfillcolor(RGB(50, 50, 50));
+    solidrectangle(SCREEN_WIDTH - 320, 45, SCREEN_WIDTH - 20, 55);
+    if (boss->getHp() > 0) {
+        setfillcolor(boss->getHp() <= boss->getMaxHp() / 2 ? RGB(200, 30, 150) : RGB(200, 50, 50));
+        float hpRatio = (float)boss->getHp() / boss->getMaxHp();
+        solidrectangle(SCREEN_WIDTH - 320, 45, SCREEN_WIDTH - 320 + (int)(300 * hpRatio), 55);
+    }
+}
+
+int main() {
+    initgraph(SCREEN_WIDTH, SCREEN_HEIGHT);
+    setbkcolor(RGB(20, 20, 25));
+
+    Player* player = new Player(100, GROUND_Y - 50);
+    Boss* boss = new Boss(600, GROUND_Y - 90);
+    AddObject(player);
+    AddObject(boss);
+
+    bool running = true;
+    while (running) {
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) running = false;
+        if (g_hitstopTimer > 0) {
+            g_hitstopTimer--;
+        }
+        else {
+            for (size_t i = 0; i < g_objects.size(); i++) {
+                g_objects[i]->update();
+            }
+
+            if (!player->getIsDead()) {
+                if (player->getIsAttacking()) {
+                    for (GameObject* obj : g_objects) {
+
+                        if (obj != player && !obj->getIsDead()) {
+                            Entity* enemy = dynamic_cast<Entity*>(obj);
+                            if (enemy && checkAABB(player->currentAttackBox, enemy->getHitbox())) {
+
+
+                                enemy->takeDamage(10, player->getHitbox().x < enemy->getHitbox().x ? 3.0f : -3.0f);
+                                TriggerHitstop(4);
+                                TriggerShake(6, 5);
+
+                                if (player->isPogoAttacking) {
+                                    player->pogoBounce();
+                                    TriggerShake(10, 8);
+                                }
+                            }
+                        }
+
+                    }
+                }
+
+                if (!player->getIsDashing()) {
+                    for (GameObject* obj : g_objects) {
+
+                        if (obj != player && !obj->getIsDead() && checkAABB(player->getHitbox(), obj->getHitbox())) {
+
+                            Boss* b = dynamic_cast<Boss*>(obj);
+                            if (b) {
+                                player->takeDamage(1, b->getHitbox().x > player->getHitbox().x ? -8.0f : 8.0f);
+                                TriggerHitstop(6);
+                                TriggerShake(12, 10);
+                            }
+                            Projectile* p = dynamic_cast<Projectile*>(obj);
+                            if (p) {
+                                player->takeDamage(1, 0);
+                                p->kill();
+                            }
+                        }
+                    }
+                }
+
+            }
+
+            for (auto it = g_objects.begin(); it != g_objects.end(); ) {
+                if ((*it)->getIsDead() && *it != player && *it != boss) {
+                    delete* it;
+                    it = g_objects.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+        }
+
+        BeginBatchDraw();
+        cleardevice();
+
+        int offsetX = 0, offsetY = 0;
+        if (g_shakeTimer > 0) {
+            g_shakeTimer--;
+            offsetX = (rand() % g_shakeIntensity) - (g_shakeIntensity / 2);
+            offsetY = (rand() % g_shakeIntensity) - (g_shakeIntensity / 2);
+        }
+        setorigin(offsetX, offsetY);
+
+        setfillcolor(RGB(30, 35, 40));
+        solidrectangle(0, (int)GROUND_Y, SCREEN_WIDTH, SCREEN_HEIGHT);
+        setlinecolor(RGB(50, 55, 60));
+        line(0, (int)GROUND_Y + 20, SCREEN_WIDTH, (int)GROUND_Y + 20);
+
+        for (GameObject* obj : g_objects) {
+            if (!obj->getIsDead()) obj->draw();
+        }
+
+        setorigin(0, 0);
+        drawUI(player, boss);
+
+        if (player->getIsDead()) {
+            settextcolor(RED); settextstyle(50, 0, _T("Consolas"));
+            outtextxy(SCREEN_WIDTH / 2 - 120, SCREEN_HEIGHT / 2 - 25, _T("YOU DIED"));
+        }
+        else if (boss->getIsDead()) {
+            settextcolor(YELLOW);
+            settextstyle(50, 0, _T("Consolas"));
+            outtextxy(SCREEN_WIDTH / 2 - 220, SCREEN_HEIGHT / 2 - 25, _T("GREAT ENEMY FELLED"));
+        }
+
+        EndBatchDraw();
+        Sleep(16);
+    }
+
+    for (GameObject* obj : g_objects) delete obj;
+    g_objects.clear();
+    closegraph();
+    return 0;
+}
