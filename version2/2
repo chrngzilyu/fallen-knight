@@ -1,0 +1,1091 @@
+#define NOMINMAX
+
+#include <iostream>
+#include <vector>
+#include <string>
+#include <map>
+#include <memory>
+#include <unordered_set>
+#include <cassert>
+#include <cstdio>    
+#include <cstring>
+#include <cstdlib>   
+#include <ctime>     
+#include <algorithm> 
+#include <cmath>     
+
+#include <graphics.h>      
+#include <conio.h>
+#include <windows.h>
+
+#pragma comment(lib, "msimg32.lib")
+
+#if defined(_DEBUG)
+#define ENABLE_UNIT_TESTS
+#endif
+
+const int SCREEN_WIDTH = 1280;
+const int SCREEN_HEIGHT = 720;
+const float GROUND_Y = 620.0f;
+
+enum GameState { MENU, PLAYING, PLAYER_DYING, GAME_OVER, BOSS_DYING, VICTORY };
+
+namespace BossConfig {
+    constexpr int MAX_HP = 400;
+    constexpr float WANDER_SPEED = 5.0f;      
+    constexpr float EVADE_SPEED = 18.0f;
+    constexpr float POUNCE_SPEED_X = 14.0f;
+    constexpr float POUNCE_SPEED_Y = -24.0f;
+    
+    constexpr int SCRATCH_RANGE = 195;
+    constexpr int POUNCE_RANGE = 600;
+    constexpr float ARENA_MARGIN = 75.0f;
+    
+    constexpr int LASER_FRAME = 12;
+    constexpr int LASER_DAMAGE_FRAME = 12 + 18;   
+}
+
+struct Rect { float x, y, w, h; };
+bool checkAABB(Rect a, Rect b) {
+    return (a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y);
+}
+
+void putimageAlpha(int x, int y, IMAGE* img) {
+    if (img->getwidth() <= 0) return;
+    HDC dstDC = GetImageHDC(NULL), srcDC = GetImageHDC(img);
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    AlphaBlend(dstDC, x, y, img->getwidth(), img->getheight(), srcDC, 0, 0, img->getwidth(), img->getheight(), bf);
+}
+
+class InputManager {
+private:
+    bool current[256] = { false };
+    bool previous[256] = { false };
+public:
+    void update() {
+        for (int i = 0; i < 256; i++) {
+            previous[i] = current[i];
+            current[i] = (GetAsyncKeyState(i) & 0x8000) != 0;
+        }
+    }
+    bool isKeyDown(int key) const { return current[key];
+    }
+    bool isKeyPressed(int key) const { return current[key] && !previous[key];
+    }
+    bool isKeyReleased(int key) const { return !current[key] && previous[key]; }
+};
+
+struct AnimData {
+    int startRow, startCol, frameCount, speed; bool loop;        
+};
+
+class Animator {
+private:
+    IMAGE* sheetR; IMAGE* sheetL;
+    int frameW, frameH; float scale;
+    std::map<std::string, AnimData> animations;
+    std::string currentAnim;
+    int currentFrame, frameTimer;
+    bool isFinished;
+
+public:
+    Animator() : sheetR(nullptr), sheetL(nullptr), frameW(0), frameH(0), scale(1.0f), currentFrame(0), frameTimer(0), isFinished(false) {}
+
+    void init(IMAGE* r, IMAGE* l, int fw, int fh, float s = 1.0f) {
+        sheetR = r;
+        sheetL = l; frameW = fw; frameH = fh; scale = s;
+    }
+
+    void addAnimation(const std::string& name, int startRow, int startCol, int frameCount, int speed, bool loop) {
+        animations[name] = { startRow, startCol, frameCount, speed, loop };
+    }
+
+    void play(const std::string& name) {
+        if (currentAnim == name) return;
+        if (animations.find(name) == animations.end()) return;
+        currentAnim = name; currentFrame = 0; frameTimer = 0; isFinished = false;
+    }
+
+    void update() {
+        if (currentAnim.empty() || isFinished) return;
+        AnimData& anim = animations[currentAnim];
+        frameTimer++;
+        if (frameTimer >= anim.speed) {
+            frameTimer = 0;
+            currentFrame++;
+            if (currentFrame >= anim.frameCount) {
+                if (anim.loop) currentFrame = 0;
+                else { currentFrame = anim.frameCount - 1; isFinished = true;
+                }
+            }
+        }
+    }
+
+    void draw(int x, int y, bool facingRight) {
+        if (currentAnim.empty() || !sheetR || sheetR->getwidth() <= 0) return;
+        IMAGE* currentSheet = facingRight ? sheetR : sheetL;
+        if (!currentSheet || currentSheet->getwidth() <= 0) currentSheet = sheetR;
+        AnimData& anim = animations[currentAnim];
+        
+        int totalCols = (std::max<int>)(1, currentSheet->getwidth() / frameW);
+        int flatIndex = anim.startRow * totalCols + anim.startCol + currentFrame;
+        int currentRow = flatIndex / totalCols;
+        int currentCol = flatIndex % totalCols;
+
+        if (!facingRight && sheetL && sheetL->getwidth() > 0) {
+            currentCol = (totalCols - 1) - (flatIndex % totalCols);
+        }
+        
+        int srcX = currentCol * frameW;
+        int srcY = currentRow * frameH;
+
+        HDC dstDC = GetImageHDC(NULL); HDC srcDC = GetImageHDC(currentSheet);
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        
+        AlphaBlend(dstDC, x, y, (int)(frameW * scale), (int)(frameH * scale), srcDC, srcX, srcY, frameW, frameH, bf);
+    }
+    
+    bool getIsFinished() const { return isFinished; }
+};
+
+struct GameAssets {
+    IMAGE bg, knight_r, knight_l, boss_r, boss_l;
+    IMAGE arm_proj_r, arm_proj_l;
+    IMAGE laser_sheet_r, laser_sheet_l;
+
+    void loadAll() {
+        loadimage(&bg, _T("bg.png"), SCREEN_WIDTH, SCREEN_HEIGHT); 
+        loadimage(&knight_r, _T("knight_r.png"));
+        loadimage(&knight_l, _T("knight_l.png"));
+        
+        loadimage(&boss_r, _T("boss_r.png")); 
+        loadimage(&boss_l, _T("boss_l.png"));
+        
+        loadimage(&arm_proj_r, _T("arm_projectile_r.png"));
+        loadimage(&arm_proj_l, _T("arm_projectile_l.png"));
+        
+        loadimage(&laser_sheet_r, _T("Laser_sheet_r.png"));
+        loadimage(&laser_sheet_l, _T("Laser_sheet_l.png"));
+    }
+};
+
+class Game;
+
+class GameObject {
+protected:
+    Game* game;
+    float x, y, width, height;
+    bool isDead;
+public:
+    GameObject(Game* g, float startX, float startY, float w, float h) : game(g), x(startX), y(startY), width(w), height(h), isDead(false) {}
+    virtual ~GameObject() = default;
+    virtual void update() = 0;
+    virtual void draw() = 0;
+    
+    virtual bool shouldRemoveOnDeath() const { return true;
+    } 
+    bool getIsDead() const { return isDead;
+    }
+    void kill() { isDead = true;
+    }
+    
+    virtual Rect getHitbox() const { return { x, y, width, height };
+    }
+    float getX() const { return x; }
+};
+
+class Entity : public GameObject {
+protected:
+    float vx, vy;
+    float gravity, maxSpeed;
+    bool isGrounded, facingRight;
+    int hp, maxHp;
+    int invincibilityTimer, knockbackTimer, hitFreezeTimer; 
+    Animator animator;
+
+public:
+    Entity(Game* g, float x, float y, float w, float h, int health)
+        : GameObject(g, x, y, w, h), vx(0), vy(0), gravity(1.8f), maxSpeed(12.0f), 
+        isGrounded(false), facingRight(true), hp(health), maxHp(health),
+        invincibilityTimer(0), knockbackTimer(0), hitFreezeTimer(0) {}
+
+    virtual void takeDamage(int damage, float knockbackX = 0, int freezeFrames = 0) {
+        if (invincibilityTimer <= 0) {
+        
+            hp -= damage;
+            invincibilityTimer = 35;
+            vx = knockbackX;
+            knockbackTimer = 10;
+            hitFreezeTimer = freezeFrames;
+            if (hp <= 0) { hp = 0; } 
+        }
+    }
+    int getHp() const { return hp;
+    }
+    int getMaxHp() const { return maxHp; }
+    bool isDeathAnimFinished() const { return animator.getIsFinished();
+    }
+};
+
+class Game {
+private:
+    bool running; 
+    GameState state;
+    InputManager input;
+    GameAssets assets;
+    
+    std::vector<std::unique_ptr<GameObject>> objects;
+    std::vector<std::unique_ptr<GameObject>> pendingObjects;
+    class Player* playerRef;
+    class Boss* bossRef;
+
+    int shakeTimer, shakeIntensity;
+    ExMessage lastMouseMsg; 
+    bool mouseClickedThisFrame; 
+    int fadeAlpha;
+public:
+    Game() : running(true), state(MENU), playerRef(nullptr), bossRef(nullptr), shakeTimer(0), shakeIntensity(0), mouseClickedThisFrame(false), fadeAlpha(0) {
+        memset(&lastMouseMsg, 0, sizeof(ExMessage));
+    }
+
+    bool isRunning() const { return running;
+    }
+    void setRunning(bool r) { running = r;
+    }
+    GameState getState() const { return state;
+    }
+    void setState(GameState s) { state = s; }
+    InputManager& getInput() { return input;
+    }
+    GameAssets& getAssets() { return assets; }
+    const ExMessage& getLastMouseMsg() const { return lastMouseMsg;
+    }
+    bool isMouseClicked() const { return mouseClickedThisFrame;
+    }
+    const std::vector<std::unique_ptr<GameObject>>& getObjects() const { return objects;
+    }
+
+    void triggerShake(int intensity, int frames) { shakeIntensity = intensity; shakeTimer = frames;
+    }
+    void addObject(std::unique_ptr<GameObject> obj) { pendingObjects.push_back(std::move(obj)); }
+
+    void init();
+    void update();
+    void resolveCollisions();
+    void draw();
+    void run();
+};
+
+class Projectile : public GameObject {
+private:
+    float vx;
+public:
+    Projectile(Game* g, float x, float y, float speed) : GameObject(g, x, y, 45, 45), vx(speed) {} 
+    void update() override {
+        x += vx;
+        if (x < -300 || x > SCREEN_WIDTH + 300) isDead = true;
+    }
+    void draw() override {
+        setlinecolor(RGB(150, 255, 150));
+        setfillcolor(RGB(50, 200, 100));
+        fillcircle((int)(x + width / 2), (int)(y + height / 2), 22);
+        setfillcolor(WHITE);
+        fillcircle((int)(x + width / 2), (int)(y + height / 2), 9);
+    }
+};
+
+enum class PlayerAction { Idle, Run, Jump, Fall, LightAttack, HeavyAttack, PogoDrop, PogoRebound, Dash, Block, Hurt, Dead };
+
+class Player : public Entity {
+private:
+    float jumpForce;
+    int dashCooldown;
+    int actionTimer, attackDir, chargeTimer, jumpCount;
+    float stamina, maxStamina;
+    
+    PlayerAction currentAction;
+    std::unordered_set<Entity*> hitEnemies; 
+
+public:
+    Rect currentAttackBox;
+    Player(Game* g, float startX, float startY) : Entity(g, startX, startY, 60.0f, 90.0f, 6) {
+        jumpForce = -26.0f;
+        maxSpeed = 12.0f; dashCooldown = actionTimer = attackDir = chargeTimer = 0; 
+        jumpCount = 1; stamina = maxStamina = 100.0f;
+        currentAction = PlayerAction::Idle;
+        currentAttackBox = { 0,0,0,0 };
+
+        animator.init(&g->getAssets().knight_r, &g->getAssets().knight_l, 96, 96, 1.4f);
+        animator.addAnimation("Idle", 0, 0, 7, 1, true);
+        animator.addAnimation("Run", 0, 9, 15, 2, true);    
+        animator.addAnimation("Jump", 4, 0, 3, 8, false);  
+        animator.addAnimation("Fall", 4, 3, 5, 8, false);
+        animator.addAnimation("Attack", 7, 6, 3, 2, false);
+        animator.addAnimation("Pogo", 7, 1, 5, 3, false);  
+        animator.addAnimation("Dash", 3, 1, 6, 3, true);
+        animator.addAnimation("Hurt", 8, 3, 7, 2, false);  
+        animator.addAnimation("Death", 9, 4, 9, 7, false);
+    }
+
+    bool shouldRemoveOnDeath() const override { return false;
+    }
+    float getStamina() const { return stamina; }
+    float getMaxStamina() const { return maxStamina;
+    }
+    
+    Rect getHitbox() const override {
+        return { x + 15.0f, y + 22.0f, width - 30.0f, height - 22.0f };
+    }
+
+    void checkOffensiveCollisions(); 
+    void checkDefensiveCollisions(); 
+    
+    void updateAttackBox() {
+        if (currentAction == PlayerAction::LightAttack) {
+            if (attackDir == 0) currentAttackBox = { x - 90, y, 90, 90 };
+            else if (attackDir == 1) currentAttackBox = { x + width, y, 90, 90 };
+        } else if (currentAction == PlayerAction::HeavyAttack) {
+            if (attackDir == 0) currentAttackBox = { x - 135, y - 30, 135, 120 };
+            else if (attackDir == 1) currentAttackBox = { x + width, y - 30, 135, 120 };
+        } else if (currentAction == PlayerAction::PogoDrop) {
+            currentAttackBox = { x - 15, y + height, width + 30, 60 };
+        } else {
+            currentAttackBox = { 0, 0, 0, 0 };
+        }
+    }
+
+    void takeDamage(int damage, float knockbackX = 0, int freezeFrames = 0) override {
+        if (currentAction == PlayerAction::Dead) return;
+        if (invincibilityTimer > 0) return;
+
+        if (currentAction == PlayerAction::Block && stamina >= 25.0f) {
+            stamina -= 25.0f;
+            vx = knockbackX * 0.4f; 
+            knockbackTimer = 5;
+            invincibilityTimer = 35; 
+            game->triggerShake(5, 4); 
+            return;
+        }
+        
+        Entity::takeDamage(damage, knockbackX, freezeFrames);
+        if (hp <= 0 && currentAction != PlayerAction::Dead) {
+            hp = 0;
+            currentAction = PlayerAction::Dead;
+            hitFreezeTimer = 0; 
+            invincibilityTimer = 9999; 
+            animator.play("Death");
+        }
+    }
+
+    void update() override {
+        if (currentAction == PlayerAction::Dead) {
+            if (vy > 0) vy += gravity * 1.5f;
+            else vy += gravity;
+            if (vy > 27.0f) vy = 27.0f; 
+            vx = 0; chargeTimer = 0; 
+            x += vx;
+            y += vy;
+            if (y + height >= GROUND_Y) { y = GROUND_Y - height; vy = 0;
+            }
+            animator.update(); return;
+        }
+
+        if (hitFreezeTimer > 0) {
+            hitFreezeTimer--;
+            if (invincibilityTimer > 0) invincibilityTimer--;
+            currentAction = PlayerAction::Hurt; 
+            chargeTimer = 0; 
+            animator.play("Hurt"); animator.update();
+            return;
+        }
+
+        if (currentAction != PlayerAction::Dash && currentAction != PlayerAction::LightAttack && 
+            currentAction != PlayerAction::HeavyAttack && currentAction != PlayerAction::PogoDrop && currentAction != PlayerAction::Block) {
+            stamina = (std::min)(maxStamina, stamina + 0.2f);
+        }
+
+        if (invincibilityTimer > 0) invincibilityTimer--;
+        if (dashCooldown > 0) dashCooldown--;
+        if (knockbackTimer > 0) { knockbackTimer--; vx *= 0.8f; }
+
+        bool isStateLocked = (currentAction == PlayerAction::Dash || currentAction == PlayerAction::LightAttack || 
+                              currentAction == PlayerAction::HeavyAttack || currentAction == PlayerAction::PogoDrop || currentAction == PlayerAction::Hurt);
+        if (!isStateLocked) {
+            if (game->getInput().isKeyDown('L') && stamina > 0) {
+                currentAction = PlayerAction::Block;
+                vx = 0; stamina -= 0.1f; 
+            }
+            else {
+                if (game->getInput().isKeyDown('A')) { vx = -maxSpeed;
+                facingRight = false; }
+                else if (game->getInput().isKeyDown('D')) { vx = maxSpeed;
+                facingRight = true; }
+                else { vx = 0;
+                }
+
+                if (game->getInput().isKeyPressed(VK_SPACE)) {
+                    if (isGrounded) { vy = jumpForce;
+                    isGrounded = false; currentAction = PlayerAction::Jump; }
+                    else if (jumpCount > 0) { vy = jumpForce;
+                    jumpCount--; currentAction = PlayerAction::Jump; }
+                }
+                if (!game->getInput().isKeyDown(VK_SPACE) && vy < 0) vy *= 0.3f;
+                if (game->getInput().isKeyPressed('K') && dashCooldown == 0 && stamina >= 20.0f) {
+                    stamina -= 20.0f;
+                    currentAction = PlayerAction::Dash;
+                    actionTimer = 12; dashCooldown = 40;
+                    vx = facingRight ? 33.0f : -33.0f; 
+                    invincibilityTimer = 16;
+                }
+                
+                if (game->getInput().isKeyPressed('J')) {
+                    if (!isGrounded && game->getInput().isKeyDown('S')) {
+                        if (stamina >= 15.0f) { 
+             
+                            stamina -= 15.0f;
+                            currentAction = PlayerAction::PogoDrop;
+                            vy = 45.0f; vx = 0; attackDir = 2; hitEnemies.clear();
+                        }
+                    } else if (stamina >= 10.0f) {
+                        stamina -= 10.0f;
+                        currentAction = PlayerAction::LightAttack;
+                        actionTimer = 10; chargeTimer = 1; attackDir = facingRight ? 1 : 0; hitEnemies.clear();
+                    }
+                }
+            }
+        }
+
+        if (chargeTimer > 0) {
+            if (game->getInput().isKeyDown('J')) {
+                chargeTimer++;
+            } else {
+                if (chargeTimer >= 40 && stamina >= 30.0f) {
+                    if (currentAction != PlayerAction::Dead && currentAction != PlayerAction::Hurt && currentAction != PlayerAction::Dash && currentAction != PlayerAction::PogoDrop) {
+                        stamina -= 30.0f;
+                        currentAction = PlayerAction::HeavyAttack;
+                        actionTimer = 20; attackDir = facingRight ? 1 : 0;
+                        hitEnemies.clear(); game->triggerShake(12, 10);
+                    }
+                }
+                chargeTimer = 0;
+            }
+        }
+
+        switch (currentAction) {
+            case PlayerAction::Hurt:
+                if (knockbackTimer <= 0) currentAction = isGrounded ?
+                PlayerAction::Idle : PlayerAction::Fall;
+                if (vy > 0) vy += gravity * 1.5f; else vy += gravity;
+                if (vy > 27.0f) vy = 27.0f;
+                break;
+            case PlayerAction::Block:
+                if (!game->getInput().isKeyDown('L') || stamina <= 0) currentAction = PlayerAction::Idle;
+                if (vy > 0) vy += gravity * 1.5f; else vy += gravity;
+                break;
+            case PlayerAction::PogoDrop: vy = 45.0f; break;
+            case PlayerAction::PogoRebound:
+                actionTimer--;
+                if (actionTimer <= 0) currentAction = PlayerAction::Fall; 
+                if (vy > 0) vy += gravity * 1.5f; else vy += gravity;
+                if (vy > 27.0f) vy = 27.0f;
+                if (isGrounded) currentAction = PlayerAction::Idle;
+                break;
+            case PlayerAction::Dash:
+                actionTimer--;
+                vy = 0;
+                if (actionTimer <= 0) { vx *= 0.2f; currentAction = isGrounded ? PlayerAction::Idle : PlayerAction::Fall;
+                }
+                break;
+            case PlayerAction::LightAttack:
+            case PlayerAction::HeavyAttack:
+                actionTimer--;
+                if (actionTimer <= 0) currentAction = isGrounded ? PlayerAction::Idle : PlayerAction::Fall;
+                if (!isGrounded) vy += gravity * 0.5f; 
+                break;
+            case PlayerAction::Idle:
+            case PlayerAction::Run:
+            case PlayerAction::Jump:
+            case PlayerAction::Fall:
+                if (vy > 0) vy += gravity * 1.5f;
+                else vy += gravity;
+                if (vy > 27.0f) vy = 27.0f;
+                if (isGrounded) currentAction = (fabs(vx) > 0) ?
+                PlayerAction::Run : PlayerAction::Idle;
+                else currentAction = (vy < -2.0f) ? PlayerAction::Jump : PlayerAction::Fall;
+                break;
+            default: break;
+        }
+
+        x += vx; y += vy;
+        if (y + height >= GROUND_Y) {
+            y = GROUND_Y - height;
+            vy = 0; isGrounded = true; jumpCount = 1; 
+            if (currentAction == PlayerAction::PogoDrop) {
+                currentAction = PlayerAction::Idle;
+                game->triggerShake(10, 10);
+            }
+            if (currentAction != PlayerAction::Dash) { dashCooldown -= 2;
+            if (dashCooldown < 0) dashCooldown = 0; }
+        } else { isGrounded = false;
+        }
+
+        if (x < 0) { x = 0; vx = 0;
+        }
+        if (x + width > SCREEN_WIDTH) { x = SCREEN_WIDTH - width;
+        vx = 0; }
+        
+        updateAttackBox();
+        switch (currentAction) {
+            case PlayerAction::LightAttack: animator.play("Attack"); break;
+            case PlayerAction::HeavyAttack: animator.play("Pogo"); break; 
+            case PlayerAction::PogoDrop:    animator.play("Pogo"); break;
+            case PlayerAction::PogoRebound: animator.play("Pogo"); break;
+            case PlayerAction::Dash:        animator.play("Dash"); break;
+            case PlayerAction::Block:       animator.play("Dash");
+            break; 
+            case PlayerAction::Jump:        animator.play("Jump"); break;
+            case PlayerAction::Fall:        animator.play("Fall"); break;
+            case PlayerAction::Run:         animator.play("Run"); break;
+            case PlayerAction::Idle:        animator.play("Idle"); break;
+            case PlayerAction::Hurt:        animator.play("Hurt"); break;
+            case PlayerAction::Dead:        animator.play("Death"); break; 
+            default: break;
+        }
+        animator.update();
+    }
+
+    void draw() override {
+        int drawX = (int)x - 37;
+        int drawY = (int)y - 44; 
+        if (game->getAssets().knight_r.getwidth() <= 0) {
+            if (currentAction == PlayerAction::Dead) setfillcolor(RGB(50, 50, 50));
+            else setfillcolor(RGB(100, 150, 250));
+            solidrectangle((int)x, (int)y, (int)(x + width), (int)(y + height));
+        } else animator.draw(drawX, drawY, facingRight);
+        if (chargeTimer > 12) {
+            setlinecolor(RGB(255, 200, 50));
+            setlinestyle(PS_SOLID, 3); 
+            circle((int)(x + width/2), (int)(y + height/2), 45 + (chargeTimer - 12));
+        }
+    }
+
+    void pogoBounce() {
+        vy = jumpForce * 1.1f;
+        jumpCount = 1; 
+        stamina = (std::min)(maxStamina, stamina + 20.0f); 
+        currentAction = PlayerAction::PogoRebound; 
+        actionTimer = 15; 
+        currentAttackBox = {0,0,0,0};
+    }
+    PlayerAction getCurrentAction() const { return currentAction; }
+};
+
+class Boss : public Entity {
+private:
+    enum State { WANDER, SCRATCH, POUNCE, HISS_SHOOT, EVADE, TELEGRAPH_SCRATCH, TELEGRAPH_POUNCE, LASER, DEATH };
+    State currentState;
+    int stateTimer;
+    float targetX;
+
+public:
+    Rect currentAttackBox;
+    Boss(Game* g, float startX, float startY) : Entity(g, startX, startY, 90.0f, 120.0f, BossConfig::MAX_HP) {
+        currentState = WANDER;
+        stateTimer = 0; vx = 0; targetX = 0; 
+        currentAttackBox = { 0,0,0,0 };
+
+        animator.init(&g->getAssets().boss_r, &g->getAssets().boss_l, 120, 120, 1.5f);
+        animator.addAnimation("Idle",    0, 0, 4, 6, true);
+        animator.addAnimation("Walk",    1, 0, 7, 5, true);
+        animator.addAnimation("Pounce",  2, 0, 9, 4, false); 
+        animator.addAnimation("Hiss",    3, 0, 3, 6, false);
+        animator.addAnimation("Scratch", 4, 3, 4, 4, false); 
+        animator.addAnimation("Evade",   5, 0, 7, 4, false);
+        animator.addAnimation("Hurt",    6, 0, 4, 5, false); 
+        animator.addAnimation("Death",   7, 0, 7, 6, false);
+    }
+
+    bool shouldRemoveOnDeath() const override { return false;
+    }
+
+    void updateTarget(float playerX) {
+        targetX = playerX;
+        if (currentState == WANDER || currentState == HISS_SHOOT || 
+            currentState == TELEGRAPH_SCRATCH || currentState == TELEGRAPH_POUNCE) {
+            facingRight = (targetX > x);
+        }
+    }
+
+    void update() override {
+        if (game->getState() == PLAYER_DYING || game->getState() == GAME_OVER) {
+            animator.play("Idle");
+            animator.update(); return;
+        }
+
+        if (currentState == DEATH) {
+            animator.play("Death");
+            if (animator.getIsFinished()) isDead = true; 
+            animator.update(); return;
+        }
+
+        if (hp <= 0 && currentState != DEATH) {
+            currentState = DEATH;
+            currentAttackBox = {0,0,0,0};
+            animator.play("Death"); hitFreezeTimer = 0; return;
+        }
+
+        if (hitFreezeTimer > 0) { 
+            hitFreezeTimer--;
+            if (invincibilityTimer > 0) invincibilityTimer--; 
+            currentAttackBox = { 0,0,0,0 };
+            animator.play("Hurt"); animator.update();
+            return;
+        }
+
+        if (invincibilityTimer > 0) invincibilityTimer--;
+        currentAttackBox = { 0,0,0,0 };
+
+        stateTimer++;
+        switch (currentState) {
+        case WANDER:
+            animator.play("Walk");
+            vy += gravity; y += vy;
+            if (y + height >= GROUND_Y) { y = GROUND_Y - height;
+            vy = 0; }
+            
+            vx = facingRight ?
+            BossConfig::WANDER_SPEED : -BossConfig::WANDER_SPEED; x += vx;
+            if (x < BossConfig::ARENA_MARGIN || x > SCREEN_WIDTH - BossConfig::ARENA_MARGIN - width) vx = -vx;
+            if (stateTimer > 40) {
+                float dist = fabs(targetX - x);
+                int r = rand() % 100;
+                
+                if (dist < BossConfig::SCRATCH_RANGE) {
+                    if (r < 25) currentState = EVADE;
+                    else currentState = TELEGRAPH_SCRATCH;
+                }
+                else if (dist < BossConfig::POUNCE_RANGE) {
+                    if (r < 35) currentState = HISS_SHOOT;
+                    else if (r < 70) currentState = TELEGRAPH_POUNCE;
+                    else { stateTimer = 0; return;
+                    } 
+                }
+                else {
+                    if (r < 60) currentState = HISS_SHOOT;
+                    else currentState = TELEGRAPH_POUNCE;
+                }
+                stateTimer = 0;
+                vx = 0;
+            }
+            break;
+        case TELEGRAPH_SCRATCH: 
+            animator.play("Hiss");
+            vx = 0;
+            vy += gravity; y += vy;
+            if (y + height >= GROUND_Y) { y = GROUND_Y - height;
+            vy = 0; }
+            
+            if (animator.getIsFinished()) { currentState = SCRATCH;
+            stateTimer = 0; }
+            break;
+        case TELEGRAPH_POUNCE: 
+            animator.play("Hiss");
+            vx = 0;
+            vy += gravity; y += vy;
+            if (y + height >= GROUND_Y) { y = GROUND_Y - height;
+            vy = 0; }
+            
+            if (animator.getIsFinished()) { currentState = POUNCE;
+            stateTimer = 0; }
+            break;
+        case SCRATCH:
+            animator.play("Scratch");
+            vx = 0; vy += gravity;
+            y += vy;
+            if (y + height >= GROUND_Y) { y = GROUND_Y - height; vy = 0;
+            }
+            
+            if (stateTimer > 2 && stateTimer < 14) { 
+                currentAttackBox = facingRight ?
+                Rect{ x + width, y + 30.0f, 90.0f, height - 30.0f } : 
+                    Rect{ x - 90.0f, y + 30.0f, 90.0f, height - 30.0f };
+            }
+            if (animator.getIsFinished()) { currentState = WANDER;
+            stateTimer = 0; }
+            break;
+        case POUNCE:
+            animator.play("Pounce");
+            if (stateTimer == 1) { 
+                vy = BossConfig::POUNCE_SPEED_Y;
+                vx = facingRight ? BossConfig::POUNCE_SPEED_X : -BossConfig::POUNCE_SPEED_X;
+            }
+            vy += gravity;
+            x += vx; y += vy;
+            
+            currentAttackBox = { x - 15.0f, y, width + 30.0f, height };
+            if (y + height >= GROUND_Y && vy > 0) { 
+                y = GROUND_Y - height;
+                vy = 0; vx = 0;
+                game->triggerShake(12, 10);
+                if (animator.getIsFinished()) { currentState = WANDER; stateTimer = 0;
+                }
+            }
+            break;
+        case EVADE:
+            animator.play("Evade");
+            if (stateTimer == 1) {
+                vx = facingRight ?
+                -BossConfig::EVADE_SPEED : BossConfig::EVADE_SPEED;
+            }
+            vx *= 0.9f;
+            x += vx;
+            vy += gravity; y += vy;
+            if (y + height >= GROUND_Y) { y = GROUND_Y - height;
+            vy = 0; }
+            
+            invincibilityTimer = 2;
+            if (animator.getIsFinished()) { currentState = WANDER; stateTimer = 0; vx = 0;
+            }
+            break;
+        case HISS_SHOOT:
+            animator.play("Hiss");
+            vx = 0; vy += gravity;
+            y += vy;
+            if (y + height >= GROUND_Y) { y = GROUND_Y - height; vy = 0;
+            }
+            
+            if (stateTimer == 15) { 
+                game->addObject(std::make_unique<Projectile>(game, facingRight ? x + width : x - 60, y + 45, facingRight ? 18.0f : -18.0f));
+            }
+            if (animator.getIsFinished()) { currentState = WANDER;
+            stateTimer = 0; }
+            break;
+        case LASER:
+            animator.play("Laser");
+            if (stateTimer > BossConfig::LASER_DAMAGE_FRAME) {
+                float lx = facingRight ?
+                x + 135.0f : x - 495.0f;
+                currentAttackBox = { lx, y + 45.0f, 450.0f, 60.0f };
+                game->triggerShake(8, 8);
+            } else {
+                currentAttackBox = {0,0,0,0};
+            }
+            if (animator.getIsFinished()) { currentState = WANDER;
+            stateTimer = 0; }
+            break;
+
+        default: break;
+        }
+
+        if (x < 0) x = 0;
+        if (x + width > SCREEN_WIDTH) x = SCREEN_WIDTH - width;
+
+        animator.update();
+    }
+
+    void draw() override {
+        int drawX = (int)x - 45;
+        int drawY = (int)y - 60; 
+        
+        if (game->getAssets().boss_r.getwidth() <= 0) {
+            setfillcolor(RGB(200, 100, 150));
+            solidrectangle((int)x, (int)y, (int)(x + width), (int)(y + height));
+        }
+        else animator.draw(drawX, drawY, facingRight);
+        if (currentState == LASER && stateTimer > BossConfig::LASER_FRAME) {
+            IMAGE* laserImg = facingRight ?
+            &game->getAssets().laser_sheet_r : &game->getAssets().laser_sheet_l;
+            if (laserImg->getwidth() > 0) {
+                int totalFrames = 14;
+                int frameH = 100;
+                int currentSprFrame = ((stateTimer - BossConfig::LASER_FRAME) / 2);
+                if (currentSprFrame >= totalFrames) currentSprFrame = totalFrames - 1;
+                if (currentSprFrame < 0) currentSprFrame = 0;
+                int lx = facingRight ? (int)x + 135 : (int)x - 495;
+                int ly = (int)y + 15;
+                HDC dstDC = GetImageHDC(NULL);
+                HDC srcDC = GetImageHDC(laserImg);
+                BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+                AlphaBlend(dstDC, lx, ly, 450, 150, srcDC, 0, currentSprFrame * frameH, 300, frameH, bf);
+            } else {
+                if (currentAttackBox.w > 0) {
+                    setfillcolor(RGB(255, 50, 50));
+                    solidrectangle((int)currentAttackBox.x, (int)currentAttackBox.y, 
+                                  (int)(currentAttackBox.x + currentAttackBox.w), (int)(currentAttackBox.y + currentAttackBox.h));
+                }
+            }
+        }
+    }
+};
+
+void Player::checkOffensiveCollisions() {
+    if (currentAction != PlayerAction::LightAttack && currentAction != PlayerAction::HeavyAttack && currentAction != PlayerAction::PogoDrop) return;
+    for (auto& obj : game->getObjects()) {
+        Entity* enemy = dynamic_cast<Entity*>(obj.get());
+        if (enemy && enemy != this && !enemy->getIsDead()) {
+            if (checkAABB(currentAttackBox, enemy->getHitbox())) {
+                if (hitEnemies.find(enemy) == hitEnemies.end()) {
+                    int dmg = (currentAction == PlayerAction::HeavyAttack) ?
+                    25 : 10;
+                    enemy->takeDamage(dmg, getHitbox().x < enemy->getHitbox().x ? 6.0f : -6.0f, 8);
+                    hitEnemies.insert(enemy); 
+                    game->triggerShake(12, 8);
+                    stamina = (std::min)(maxStamina, stamina + 15.0f); 
+                    
+                    if (currentAction == PlayerAction::PogoDrop) {
+                        pogoBounce();
+                        game->triggerShake(20, 15); return; 
+                    }
+                }
+            }
+        }
+    }
+}
+
+void Player::checkDefensiveCollisions() {
+    if (currentAction == PlayerAction::Dash) return;
+    for (auto& obj : game->getObjects()) {
+        if (obj.get() != this && !obj->getIsDead()) {
+            Boss* b = dynamic_cast<Boss*>(obj.get());
+            if (b && b->currentAttackBox.w > 0 && checkAABB(getHitbox(), b->currentAttackBox)) {
+                takeDamage(1, b->getHitbox().x > getHitbox().x ? -15.0f : 15.0f, 8);
+                game->triggerShake(20, 12);
+            }
+            Projectile* p = dynamic_cast<Projectile*>(obj.get());
+            if (p && checkAABB(getHitbox(), p->getHitbox())) {
+                takeDamage(1, 0, 5);
+                p->kill();
+            }
+        }
+    }
+}
+
+void DrawStylizedText(int x, int y, const TCHAR* text, COLORREF mainColor, int size, const TCHAR* fontName, int weight = 400, bool hasGlow = true) {
+    setbkmode(TRANSPARENT);
+    settextstyle(size, 0, fontName, 0, 0, weight, false, false, false);
+    
+    if (hasGlow) {
+        settextcolor(RGB(255, 255, 255));
+        outtextxy(x + 1, y + 1, text);
+    }
+    
+    settextcolor(mainColor);
+    outtextxy(x, y, text);
+}
+
+void DrawCenteredText(int y, const TCHAR* text, COLORREF color, int size, const TCHAR* fontName, int weight = 400, bool hasGlow = true) {
+    settextstyle(size, 0, fontName, 0, 0, weight, false, false, false);
+    int tw = textwidth(text);
+    DrawStylizedText((SCREEN_WIDTH - tw) / 2, y, text, color, size, fontName, weight, hasGlow);
+}
+
+bool DrawPremiumButton(Game* game, int x, int y, int w, int h, const TCHAR* text) {
+    const ExMessage& msg = game->getLastMouseMsg();
+    bool isHover = (msg.x >= x && msg.x <= x + w && msg.y >= y && msg.y <= y + h);
+    settextstyle(36, 0, _T("微软雅黑"), 0, 0, 400, false, false, false);
+    
+    int tx = x + (w - textwidth(text)) / 2;
+    int ty = y + (h - textheight(text)) / 2;
+    if (isHover) {
+        DrawStylizedText(tx, ty, text, RGB(0, 0, 0), 36, _T("微软雅黑"), 800, true);
+        int textW = textwidth(text);
+        setlinecolor(RGB(0, 0, 0));
+        setlinestyle(PS_SOLID, 2);
+        line(tx - 25, ty + 45, tx + textW + 25, ty + 45);
+        setfillcolor(RGB(0, 0, 0));
+        solidcircle(tx - 35, ty + 20, 4);
+        solidcircle(tx + textW + 35, ty + 20, 4);
+    } else {
+        DrawStylizedText(tx, ty, text, RGB(80, 80, 80), 36, _T("微软雅黑"), 400, false);
+    }
+    
+    return (isHover && game->isMouseClicked());
+}
+
+void Game::init() {
+    objects.clear(); pendingObjects.clear();
+    auto p = std::make_unique<Player>(this, 200.0f, GROUND_Y - 90.0f);
+    playerRef = p.get(); objects.push_back(std::move(p));
+    
+    auto b = std::make_unique<Boss>(this, 980.0f, GROUND_Y - 120.0f); 
+    bossRef = b.get(); objects.push_back(std::move(b));
+    
+    shakeTimer = 0;
+    fadeAlpha = 0; state = PLAYING;
+}
+
+void Game::resolveCollisions() {
+    if (playerRef && !playerRef->getIsDead()) {
+        playerRef->checkOffensiveCollisions();
+        playerRef->checkDefensiveCollisions();
+    }
+}
+
+void Game::update() {
+    if (state == PLAYING) {
+        if (bossRef && !bossRef->getIsDead() && playerRef) bossRef->updateTarget(playerRef->getX());
+        for (auto& obj : objects) { if (!obj->getIsDead()) obj->update(); }
+        resolveCollisions();
+        if (playerRef && playerRef->getHp() <= 0) { state = PLAYER_DYING; fadeAlpha = 0;
+        }
+        else if (bossRef && bossRef->getHp() <= 0) { state = BOSS_DYING;
+        fadeAlpha = 0; }
+
+        for (auto& obj : pendingObjects) objects.push_back(std::move(obj));
+        pendingObjects.clear();
+        objects.erase(
+            std::remove_if(objects.begin(), objects.end(), [](const std::unique_ptr<GameObject>& obj) { return obj->getIsDead() && obj->shouldRemoveOnDeath(); }),
+            objects.end()
+        );
+    }
+    else if (state == PLAYER_DYING) {
+        if (playerRef) playerRef->update();
+        fadeAlpha = (std::min)(220, fadeAlpha + 2); 
+        if (fadeAlpha >= 220 && playerRef->isDeathAnimFinished()) state = GAME_OVER;
+    }
+    else if (state == BOSS_DYING) {
+        if (playerRef) playerRef->update();
+        if (bossRef) bossRef->update();     
+        fadeAlpha = (std::min)(180, fadeAlpha + 2); 
+        if (bossRef->isDeathAnimFinished()) state = VICTORY;
+    }
+}
+
+void Game::draw() {
+    BeginBatchDraw();
+    cleardevice();
+    
+    if (state == MENU) {
+        if (assets.bg.getwidth() > 0) putimageAlpha(0, 0, &assets.bg);
+        else { setfillcolor(RGB(200, 200, 200)); solidrectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT); }
+        
+        DrawStylizedText(220, 150, _T("F A L L E N   K N I G H T"), RGB(0, 0, 0), 90, _T("Georgia"), 800, true);
+        setlinecolor(RGB(80, 80, 80)); setlinestyle(PS_SOLID, 2);
+        line(280, 280, 1000, 280);
+        setfillcolor(RGB(80, 80, 80));
+        solidcircle(640, 280, 4);
+        if (DrawPremiumButton(this, 440, 360, 400, 70, _T("开 始 游 戏"))) init();
+        if (DrawPremiumButton(this, 440, 460, 400, 70, _T("退 出 游 戏"))) running = false;
+        DrawCenteredText(600, _T("◆ 操 作 指 南 ◆"), RGB(60, 60, 60), 24, _T("微软雅黑"), 800, false);
+        DrawCenteredText(640, _T("[ A / D ] 移动    [ Space ] 跳跃 / 二段跳    [ K ] 冲刺避险"), RGB(60, 60, 60), 22, _T("微软雅黑"), 400, false);
+        DrawCenteredText(670, _T("[ J ] 轻击    [ 长按 J ] 蓄力重斩    [ 空中 S + J ] 下劈反弹"), RGB(60, 60, 60), 22, _T("微软雅黑"), 400, false);
+        DrawCenteredText(700, _T("[ L ] 完美格挡 (消耗精力免疫受击)"), RGB(60, 60, 60), 22, _T("微软雅黑"), 400, false);
+    }
+    else {
+        int offsetX = 0, offsetY = 0;
+        if (shakeTimer > 0) { 
+            shakeTimer--;
+            offsetX = (rand() % shakeIntensity) - (shakeIntensity / 2); 
+            offsetY = (rand() % shakeIntensity) - (shakeIntensity / 2);
+        }
+        setorigin(offsetX, offsetY);
+
+        if (assets.bg.getwidth() > 0) putimageAlpha(0, 0, &assets.bg);
+        else { 
+            setfillcolor(RGB(200, 200, 200));
+            solidrectangle(0, (int)GROUND_Y, SCREEN_WIDTH, SCREEN_HEIGHT); 
+            setlinecolor(RGB(150, 150, 150)); line(0, (int)GROUND_Y + 20, SCREEN_WIDTH, (int)GROUND_Y + 20);
+        }
+
+        for (auto& obj : objects) obj->draw();
+        setorigin(0, 0);
+        if (state == PLAYER_DYING || state == GAME_OVER || state == BOSS_DYING || state == VICTORY) {
+            IMAGE fadeImg(1, 1);
+            SetWorkingImage(&fadeImg);
+            setfillcolor(BLACK); solidrectangle(0, 0, 1, 1);
+            SetWorkingImage(NULL);
+
+            BLENDFUNCTION bf = { AC_SRC_OVER, 0, (BYTE)fadeAlpha, AC_SRC_ALPHA };
+            AlphaBlend(GetImageHDC(NULL), 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, GetImageHDC(&fadeImg), 0, 0, 1, 1, bf);
+        }
+
+        if (state == PLAYING || state == BOSS_DYING) {
+            if (playerRef && bossRef) {
+                DrawStylizedText(25, 22, _T("HP"), RGB(0, 0, 0), 28, _T("Georgia"), 800, true);
+                for (int i = 0; i < playerRef->getMaxHp(); i++) {
+                    int bx = 75 + i * 38;
+                    setlinecolor(RGB(80, 80, 80)); setlinestyle(PS_SOLID, 2);
+                    rectangle(bx, 25, bx + 30, 45);
+                    if (i < playerRef->getHp()) {
+                        setfillcolor(RGB(220, 220, 220));
+                        solidrectangle(bx + 2, 27, bx + 28, 43);
+                    }
+                }
+                
+                DrawStylizedText(25, 60, _T("SP"), RGB(0, 0, 0), 28, _T("Georgia"), 800, true);
+                setlinecolor(RGB(80, 80, 80)); setlinestyle(PS_SOLID, 2);
+                rectangle(75, 60, 75 + 220, 72);
+                if (playerRef->getStamina() > 0) {
+                    setfillcolor(RGB(60, 200, 100));
+                    solidrectangle(77, 62, 75 + (int)(216 * playerRef->getStamina() / playerRef->getMaxStamina()), 70);
+                }
+
+                if (bossRef->getHp() > 0) {
+                    int bw = 750;
+                    int bh = 15;
+                    int bx = (SCREEN_WIDTH - bw) / 2; int by = SCREEN_HEIGHT - 60;
+                    DrawStylizedText(bx + bw/2 - 130, by - 35, _T("D E M O N   C A T"), RGB(0, 0, 0), 28, _T("Georgia"), 800, true);
+                    setlinecolor(RGB(50, 50, 50)); setlinestyle(PS_SOLID, 3);
+                    rectangle(bx, by, bx + bw, by + bh);
+                    setfillcolor(RGB(180, 40, 40));
+                    solidrectangle(bx + 2, by + 2, bx + (int)((bw - 4) * ((float)bossRef->getHp() / BossConfig::MAX_HP)), by + bh - 2);
+                }
+            }
+        } 
+        
+        if (state == GAME_OVER) {
+            DrawStylizedText(400, 220, _T("Y O U   D I E D"), RGB(180, 20, 20), 100, _T("Georgia"), 800, true);
+            setlinecolor(RGB(80, 20, 20)); setlinestyle(PS_SOLID, 2);
+            line(350, 360, 930, 360);
+            
+            if (DrawPremiumButton(this, 440, 440, 400, 70, _T("重 塑 肉 身"))) init();
+            if (DrawPremiumButton(this, 440, 540, 400, 70, _T("放 弃 使 命"))) { state = MENU;
+            }
+        }
+        else if (state == VICTORY) {
+            DrawStylizedText(210, 220, _T("G R E A T   E N E M Y   F E L L E D"), RGB(0, 0, 0), 70, _T("Georgia"), 800, true);
+            setlinecolor(RGB(80, 80, 80)); setlinestyle(PS_SOLID, 2);
+            line(250, 360, 1030, 360);
+            
+            if (DrawPremiumButton(this, 440, 440, 400, 70, _T("再 战 一 次"))) init();
+            if (DrawPremiumButton(this, 440, 540, 400, 70, _T("归 于 沉 寂"))) { state = MENU;
+            }
+        }
+    }
+
+    EndBatchDraw();
+}
+
+void Game::run() {
+    while (running) {
+        MSG wmsg;
+        if (PeekMessage(&wmsg, NULL, 0, 0, PM_REMOVE)) {
+            if (wmsg.message == WM_QUIT) break;
+            TranslateMessage(&wmsg); DispatchMessage(&wmsg);
+        }
+        
+        mouseClickedThisFrame = false;
+        while (peekmessage(&lastMouseMsg, EM_MOUSE)) {
+            if (lastMouseMsg.message == WM_LBUTTONDOWN) mouseClickedThisFrame = true;
+        } 
+        
+        input.update();
+        if (input.isKeyPressed(VK_ESCAPE)) break;
+
+        update();
+        draw();
+        Sleep(16);
+    }
+}
+
+int main() {
+    srand((unsigned)time(nullptr)); 
+    initgraph(SCREEN_WIDTH, SCREEN_HEIGHT);
+    
+    Game game;
+    game.getAssets().loadAll(); 
+    game.run();
+
+    closegraph();
+    return 0;
+}
